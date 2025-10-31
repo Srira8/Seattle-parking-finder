@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Seattle Parking Finder</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+  <style>
+    body { margin: 0; padding: 0; }
+    #map { flex: 2; height: 100vh; }
+    #parking-list { 
+      flex: 1; 
+      overflow-y: auto; 
+      padding: 10px; 
+      border-left: 1px solid #ccc; 
+      font-family: Arial;
+    }
+    .parking-box {
+      border-radius: 5px;
+      padding: 8px;
+      margin-bottom: 6px;
+      background-color: #f9f9f9;
+      cursor: pointer;
+      transition: transform 0.2s;
+    }
+    .parking-box:hover { transform: scale(1.02); }
+    #legend {
+      position: absolute;
+      bottom: 30px;
+      left: 10px;
+      background: white;
+      padding: 10px;
+      border: 1px solid #ccc;
+      font-size: 14px;
+      z-index: 1000;
+    }
+    #search-container {
+      position: absolute;
+      top: 10px; 
+      left: 10px; 
+      z-index: 1001; 
+      background: white; 
+      padding: 5px; 
+      border: 1px solid #ccc;
+    }
+    #search-container input { width: 200px; }
+  </style>
+</head>
+<body>
+  <!-- Search bar -->
+  <div id="search-container">
+    <input type="text" id="search-location" placeholder="Enter address or area">
+    <button id="search-btn">Search</button>
+  </div>
+
+  <div style="display:flex; height:100vh;">
+    <div id="map"></div>
+    <div id="parking-list"></div>
+  </div>
+
+  <div id="legend">
+    <strong>Legend:</strong><br>
+    <span style="color:green;">●</span> Available (circle size = distance to focus)<br>
+    <span style="color:red;">●</span> Full / Not Available<br>
+    <span style="color:orange;">●</span> Unknown<br>
+    <span style="color:blue;">●</span> Focus Location
+  </div>
+
+  <script>
+    const map = L.map('map').setView([47.6062, -122.3321], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    const listDiv = document.getElementById('parking-list');
+    let markers = [];
+    let userCoords = null;
+
+    // Highlight area rectangle
+    const bounds = [[47.604, -122.335], [47.608, -122.33]];
+    const area = L.rectangle(bounds, {color: "#3388ff", weight: 2, fillOpacity: 0.1}).addTo(map);
+
+    function clearMarkers() {
+      markers.forEach(marker => map.removeLayer(marker));
+      markers = [];
+    }
+
+    function getMarkerColor(sensor) {
+      const status = (sensor.status || '').toLowerCase();
+      const location = (sensor.location || '').toLowerCase();
+      if (status.includes('open') || status.includes('available') || location.includes('free')) return 'green';
+      if (status.includes('closed') || status.includes('full') || location.includes('occupied')) return 'red';
+      return 'orange';
+    }
+
+    function getDistance(lat1, lng1, lat2, lng2) {
+      const R = 6371; // km
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLng = (lng2 - lng1) * Math.PI / 180;
+      const a = Math.sin(dLat/2) ** 2 +
+                Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) *
+                Math.sin(dLng/2) ** 2;
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      return R * c; // km
+    }
+
+    function renderParkingList(data) {
+      listDiv.innerHTML = '';
+      if (!userCoords) return;
+
+      // Sort by distance from focus location
+      data.sort((a, b) => {
+        if (!a.latitude || !a.longitude) return 1;
+        if (!b.latitude || !b.longitude) return -1;
+        const d1 = getDistance(a.latitude, a.longitude, userCoords[0], userCoords[1]);
+        const d2 = getDistance(b.latitude, b.longitude, userCoords[0], userCoords[1]);
+        return d1 - d2;
+      });
+
+      data.forEach(sensor => {
+        const color = getMarkerColor(sensor);
+        const distance = sensor.latitude && sensor.longitude ? getDistance(sensor.latitude, sensor.longitude, userCoords[0], userCoords[1]) : null;
+
+        const box = document.createElement('div');
+        box.className = 'parking-box';
+        box.style.border = `2px solid ${color}`;
+        box.innerHTML = `<strong>${sensor.location || 'Unknown'}</strong><br>
+                         Status: ${sensor.status || 'N/A'}<br>
+                         ${distance !== null ? 'Distance: ' + (distance*1000).toFixed(0) + ' m' : ''}`;
+
+        box.addEventListener('click', () => {
+          if (sensor.latitude && sensor.longitude) {
+            map.setView([sensor.latitude, sensor.longitude], 17);
+            const highlight = L.circleMarker([sensor.latitude, sensor.longitude], {
+              radius: 15,
+              color: '#ff7800',
+              fillColor: '#ff7800',
+              fillOpacity: 0.8
+            }).addTo(map);
+            setTimeout(() => map.removeLayer(highlight), 3000);
+          }
+        });
+
+        listDiv.appendChild(box);
+      });
+    }
+
+    async function loadParking() {
+      try {
+        const res = await axios.get('http://localhost:3000/parking');
+        clearMarkers();
+
+        res.data.forEach(sensor => {
+          if (sensor.latitude && sensor.longitude) {
+            const color = getMarkerColor(sensor);
+            let radius = 8;
+
+            if (color === 'green' && userCoords) {
+              const distance = getDistance(sensor.latitude, sensor.longitude, userCoords[0], userCoords[1]);
+              if (distance < 0.5) radius = 20;   // close spots
+              else if (distance < 1) radius = 15; // medium
+              else radius = 10;                  // further away
+            } else if (color !== 'green') {
+              radius = 8; // default
+            }
+
+            const marker = L.circleMarker([sensor.latitude, sensor.longitude], {
+              radius: radius,
+              color: color,
+              fillColor: color,
+              fillOpacity: 0.8
+            }).addTo(map)
+              .bindPopup(`${sensor.location || 'Unknown'}<br>Status: ${sensor.status || 'N/A'}`);
+            markers.push(marker);
+          }
+        });
+
+        renderParkingList(res.data);
+
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function geocodeAddress(address) {
+      try {
+        const res = await axios.get('https://nominatim.openstreetmap.org/search', {
+          params: { q: address, format: 'json', limit: 1 }
+        });
+        if (res.data && res.data.length > 0) {
+          return [parseFloat(res.data[0].lat), parseFloat(res.data[0].lon)];
+        } else {
+          alert("Location not found");
+          return null;
+        }
+      } catch (err) {
+        console.error(err);
+        alert("Error fetching location");
+        return null;
+      }
+    }
+
+    document.getElementById('search-btn').addEventListener('click', async () => {
+      const address = document.getElementById('search-location').value;
+      if (!address) return;
+      const coords = await geocodeAddress(address);
+      if (!coords) return;
+
+      userCoords = coords;
+      map.setView(coords, 15);
+
+      // Focus location marker
+      L.circleMarker(coords, {
+        radius: 10,
+        color: 'blue',
+        fillColor: 'blue',
+        fillOpacity: 0.8
+      }).addTo(map).bindPopup('Focus Location').openPopup();
+
+      loadParking();
+    });
+
+    // Initial load
+    loadParking();
+    setInterval(loadParking, 60000);
+  </script>
+</body>
+</html>
